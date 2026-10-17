@@ -1,0 +1,114 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.amoro.server;
+
+import org.apache.amoro.config.Configurations;
+import org.apache.amoro.resource.ResourceGroup;
+import org.apache.amoro.server.manager.EventsManager;
+import org.apache.amoro.server.manager.MetricManager;
+import org.apache.amoro.server.process.ProcessService;
+import org.apache.amoro.server.table.DefaultTableRuntime;
+import org.apache.amoro.server.table.DefaultTableRuntimeFactory;
+import org.apache.amoro.server.table.DefaultTableService;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.BeforeClass;
+
+import java.time.Duration;
+
+public abstract class AMSServiceTestBase extends AMSManagerTestBase {
+  // Normal optimizer tests may block in pollTask for 3 seconds. Keep the heartbeat timeout well
+  // outside that window so CI scheduling delays do not turn unrelated tests into expiry tests.
+  private static final Duration DEFAULT_OPTIMIZER_HEARTBEAT_TIMEOUT = Duration.ofSeconds(10);
+
+  private static DefaultTableService TABLE_SERVICE = null;
+  private static DefaultOptimizingService OPTIMIZING_SERVICE = null;
+  private static ProcessService PROCESS_SERVICE = null;
+
+  @BeforeClass
+  public static void initTableService() {
+    initTableService(DEFAULT_OPTIMIZER_HEARTBEAT_TIMEOUT);
+  }
+
+  protected static void initTableService(Duration optimizerHeartbeatTimeout) {
+    DefaultTableRuntimeFactory runtimeFactory = new DefaultTableRuntimeFactory();
+    try {
+      Configurations configurations = new Configurations();
+      configurations.set(AmoroManagementConf.OPTIMIZER_HB_TIMEOUT, optimizerHeartbeatTimeout);
+      configurations.set(
+          AmoroManagementConf.OPTIMIZER_TASK_EXECUTE_TIMEOUT, Duration.ofMillis(30000L));
+      // must stay above OPTIMIZER_POLLING_TIMEOUT (3s): a blocking pollTask waiting out its full
+      // timeout would otherwise pick up the task the keeper reset by ack-timeout in the meantime
+      configurations.set(AmoroManagementConf.OPTIMIZER_TASK_ACK_TIMEOUT, Duration.ofMillis(5000L));
+      configurations.set(
+          AmoroManagementConf.OPTIMIZER_GROUP_MIN_PARALLELISM_CHECK_INTERVAL,
+          Duration.ofMillis(10L));
+      TABLE_SERVICE =
+          new DefaultTableService(new Configurations(), CATALOG_MANAGER, runtimeFactory);
+      OPTIMIZING_SERVICE =
+          new DefaultOptimizingService(
+              configurations, CATALOG_MANAGER, OPTIMIZER_MANAGER, TABLE_SERVICE, null, null);
+      PROCESS_SERVICE = new ProcessService(TABLE_SERVICE);
+
+      TABLE_SERVICE.addHandlerChain(OPTIMIZING_SERVICE.getTableRuntimeHandler());
+      TABLE_SERVICE.addHandlerChain(PROCESS_SERVICE.getTableHandlerChain());
+      TABLE_SERVICE.initialize();
+      ResourceGroup group = defaultResourceGroup();
+      try {
+        OPTIMIZER_MANAGER.createResourceGroup(group);
+      } catch (Throwable ignored) {
+      }
+      try {
+        OPTIMIZING_SERVICE.createResourceGroup(group);
+      } catch (Throwable ignored) {
+      }
+    } catch (Throwable throwable) {
+      Assert.fail(throwable.getMessage());
+    }
+  }
+
+  @AfterClass
+  public static void disposeTableService() {
+    TABLE_SERVICE.dispose();
+    OPTIMIZING_SERVICE.dispose();
+    PROCESS_SERVICE.dispose();
+    MetricManager.dispose();
+    EventsManager.dispose();
+  }
+
+  protected DefaultTableService tableService() {
+    return TABLE_SERVICE;
+  }
+
+  protected DefaultTableRuntime getDefaultTableRuntime(long tableId) {
+    return (DefaultTableRuntime) tableService().getRuntime(tableId);
+  }
+
+  protected DefaultOptimizingService optimizingService() {
+    return OPTIMIZING_SERVICE;
+  }
+
+  protected ProcessService processServiceService() {
+    return PROCESS_SERVICE;
+  }
+
+  protected static ResourceGroup defaultResourceGroup() {
+    return new ResourceGroup.Builder("default", "local").build();
+  }
+}

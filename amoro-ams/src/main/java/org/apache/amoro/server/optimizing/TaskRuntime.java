@@ -1,0 +1,451 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.amoro.server.optimizing;
+
+import org.apache.amoro.StateField;
+import org.apache.amoro.api.OptimizingTask;
+import org.apache.amoro.api.OptimizingTaskId;
+import org.apache.amoro.api.OptimizingTaskResult;
+import org.apache.amoro.exception.IllegalTaskStateException;
+import org.apache.amoro.exception.TaskRuntimeException;
+import org.apache.amoro.optimizing.TaskProperties;
+import org.apache.amoro.process.SimpleFuture;
+import org.apache.amoro.process.StagedTaskDescriptor;
+import org.apache.amoro.server.AmoroServiceConstants;
+import org.apache.amoro.server.persistence.StatedPersistentBase;
+import org.apache.amoro.server.persistence.mapper.OptimizingProcessMapper;
+import org.apache.amoro.server.resource.OptimizerThread;
+import org.apache.amoro.shade.guava32.com.google.common.base.MoreObjects;
+import org.apache.amoro.shade.guava32.com.google.common.collect.ImmutableMap;
+import org.apache.amoro.shade.guava32.com.google.common.collect.ImmutableSet;
+import org.apache.amoro.shade.guava32.com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.Set;
+
+public class TaskRuntime<T extends StagedTaskDescriptor<?, ?, ?>> extends StatedPersistentBase {
+
+  private static final Logger LOG = LoggerFactory.getLogger(TaskRuntime.class);
+
+  private final SimpleFuture future = new SimpleFuture();
+  private final TaskStatusMachine statusMachine = new TaskStatusMachine();
+  private OptimizingTaskId taskId;
+  private T taskDescriptor;
+  @StateField private Status status = Status.PLANNED;
+  @StateField private int runTimes = 0;
+  @StateField private long startTime = AmoroServiceConstants.INVALID_TIME;
+  @StateField private long endTime = AmoroServiceConstants.INVALID_TIME;
+  @StateField private long costTime = AmoroServiceConstants.INVALID_TIME;
+  @StateField private String token;
+  @StateField private int threadId = -1;
+  @StateField private String failReason;
+
+  public static long taskRunningQuotaTime(
+      long calculatingStartTime, long calculatingEndTime, long taskStartTime, long taskCostTime) {
+    if (taskStartTime == AmoroServiceConstants.INVALID_TIME) {
+      return 0;
+    }
+    calculatingStartTime = Math.max(taskStartTime, calculatingStartTime);
+    calculatingEndTime =
+        taskCostTime == AmoroServiceConstants.INVALID_TIME
+            ? calculatingEndTime
+            : taskCostTime + taskStartTime;
+    long lastingTime = calculatingEndTime - calculatingStartTime;
+    return Math.max(0, lastingTime);
+  }
+
+  private TaskRuntime() {}
+
+  public TaskRuntime(OptimizingTaskId taskId, T taskDescriptor) {
+    this.taskId = taskId;
+    this.taskDescriptor = taskDescriptor;
+  }
+
+  public T getTaskDescriptor() {
+    return taskDescriptor;
+  }
+
+  public SimpleFuture getCompletedFuture() {
+    return future;
+  }
+
+  void complete(OptimizerThread thread, OptimizingTaskResult result) {
+    // A completion for an already reset/rescheduled task is stale: the execution it reports belongs
+    // to a round that the OptimizerKeeper has already torn down. Absorb it gracefully instead of
+    // failing the (now illegal) state transition; the task will be re-executed in its current
+    // round.
+    if (isStaleResponse(thread) || status != Status.ACKED || isStaleAttempt(result)) {
+      LOG.warn(
+          "Ignoring stale completion for task {} from optimizer thread {}, current status {}, "
+              + "owner {}, attempt {} (reported attempt {}). The task was likely reset by the "
+              + "OptimizerKeeper and will be re-executed.",
+          taskId,
+          thread,
+          status,
+          getResourceDesc(),
+          currentAttemptId(),
+          reportedAttemptId(result));
+      return;
+    }
+    invokeConsistency(
+        () -> {
+          if (result.getErrorMessage() != null) {
+            statusMachine.accept(Status.FAILED);
+            failReason = result.getErrorMessage();
+          } else {
+            statusMachine.accept(Status.SUCCESS);
+            taskDescriptor.setOutputBytes(result.getTaskOutput());
+          }
+          endTime = System.currentTimeMillis();
+          costTime += endTime - startTime;
+          runTimes += 1;
+          persistTaskRuntime();
+          future.complete();
+          token = null;
+          threadId = -1;
+        });
+  }
+
+  void reset() {
+    invokeConsistency(
+        () -> {
+          if (status == Status.PLANNED) {
+            return;
+          }
+          statusMachine.accept(Status.PLANNED);
+          startTime = AmoroServiceConstants.INVALID_TIME;
+          endTime = AmoroServiceConstants.INVALID_TIME;
+          token = null;
+          threadId = -1;
+          failReason = null;
+          taskDescriptor.reset();
+          future.reset();
+          // The cost time should not be reset since it is the total cost time of all runs.
+          persistTaskRuntime();
+        });
+  }
+
+  void schedule(OptimizerThread thread) {
+    invokeConsistency(
+        () -> {
+          statusMachine.accept(Status.SCHEDULED);
+          token = thread.getToken();
+          threadId = thread.getThreadId();
+          startTime = System.currentTimeMillis();
+          stampNextAttemptId();
+          persistTaskRuntime();
+        });
+  }
+
+  void ack(OptimizerThread thread) {
+    // If the task has been reset/rescheduled, reject the stale ack so the optimizer skips executing
+    // this obsolete round (OptimizerExecutor treats the failure as "skip"). Thrown outside the
+    // transaction to avoid a misleading "failed to commit transaction" error for this expected
+    // case.
+    if (isStaleResponse(thread) || status != Status.SCHEDULED) {
+      LOG.warn(
+          "Rejecting stale ack for task {} from optimizer thread {}: current status {}, owner {}.",
+          taskId,
+          thread,
+          status,
+          getResourceDesc());
+      throw new TaskRuntimeException("Task has been reset or not yet scheduled, taskId:%s", taskId);
+    }
+    invokeConsistency(
+        () -> {
+          statusMachine.accept(Status.ACKED);
+          persistTaskRuntime();
+        });
+  }
+
+  void tryCanceling() {
+    invokeConsistency(
+        () -> {
+          if (statusMachine.tryAccepting(Status.CANCELED)) {
+            endTime = System.currentTimeMillis();
+            if (startTime != AmoroServiceConstants.INVALID_TIME) {
+              costTime += endTime - startTime;
+            }
+            persistTaskRuntime();
+            future.complete();
+          }
+        });
+  }
+
+  public boolean finished() {
+    return this.status == Status.SUCCESS
+        || this.status == Status.FAILED
+        || this.status == Status.CANCELED;
+  }
+
+  public Map<String, String> getProperties() {
+    return taskDescriptor.getProperties();
+  }
+
+  public long getProcessId() {
+    return taskId.getProcessId();
+  }
+
+  public String getResourceDesc() {
+    return token + ":" + threadId;
+  }
+
+  public String getToken() {
+    return token;
+  }
+
+  public int getThreadId() {
+    return threadId;
+  }
+
+  public OptimizingTask extractProtocolTask() {
+    return taskDescriptor.extractProtocolTask(taskId);
+  }
+
+  public long getStartTime() {
+    return startTime;
+  }
+
+  public OptimizingTaskId getTaskId() {
+    return taskId;
+  }
+
+  public Status getStatus() {
+    return status;
+  }
+
+  public int getRunTimes() {
+    return runTimes;
+  }
+
+  public int getRetry() {
+    return runTimes - 1;
+  }
+
+  public String getFailReason() {
+    return failReason;
+  }
+
+  public long getCostTime() {
+    return costTime;
+  }
+
+  public long getEndTime() {
+    return endTime;
+  }
+
+  public long getQuotaTime(long calculatingStartTime, long calculatingEndTime) {
+    return taskRunningQuotaTime(calculatingStartTime, calculatingEndTime, startTime, costTime);
+  }
+
+  public void setStatus(Status status) {
+    this.status = status;
+  }
+
+  public String getSummary() {
+    return taskDescriptor.getSummary().toString();
+  }
+
+  public long getTableId() {
+    return taskDescriptor.getTableId();
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("status", status)
+        .add("runTimes", runTimes)
+        .add("startTime", startTime)
+        .add("endTime", endTime)
+        .add("costTime", costTime)
+        .add("resourceThread", getResourceDesc())
+        .add("failReason", failReason)
+        .add("taskDescriptor", taskDescriptor)
+        .toString();
+  }
+
+  /**
+   * Detects a response from an optimizer round the task no longer belongs to: it was reset (token
+   * cleared) or has since been rescheduled to a different owner. Reads token/threadId outside
+   * {@link #invokeConsistency}, so callers must hold the owning TableOptimizingProcess lock, under
+   * which OptimizingQueue serializes ack/complete/reset/poll.
+   */
+  private boolean isStaleResponse(OptimizerThread thread) {
+    return token == null || !thread.getToken().equals(token) || thread.getThreadId() != threadId;
+  }
+
+  /**
+   * Detects a completion from a previous attempt of this task, which {@link #isStaleResponse}
+   * cannot: once a reset task is re-scheduled to the same optimizer thread and re-acked, (token,
+   * threadId, status) all match again. Optimizers echo the attempt id they received with the task
+   * back in the result summary; a result from an older optimizer carries none and is checked by
+   * (token, threadId, status) alone.
+   */
+  private boolean isStaleAttempt(OptimizingTaskResult result) {
+    String reported = reportedAttemptId(result);
+    return reported != null && !reported.equals(currentAttemptId());
+  }
+
+  /**
+   * Advances the attempt id stamped into the task properties, which reach the optimizer via {@link
+   * #extractProtocolTask()}. The properties map is replaced instead of mutated, because
+   * extractProtocolTask hands the live reference to thrift serialization outside the process lock.
+   * The id is persisted with the task, so it stays monotonic across AMS restarts; if the enclosing
+   * transaction rolls back, the in-memory increment survives (properties are not a {@link
+   * StateField}), which merely skips a value and never reuses one.
+   */
+  private void stampNextAttemptId() {
+    String current = currentAttemptId();
+    long next = current == null ? 1 : Long.parseLong(current) + 1;
+    Map<String, String> properties =
+        taskDescriptor.getProperties() == null
+            ? Maps.newHashMap()
+            : Maps.newHashMap(taskDescriptor.getProperties());
+    properties.put(TaskProperties.TASK_ATTEMPT_ID, Long.toString(next));
+    taskDescriptor.setProperties(properties);
+  }
+
+  private String currentAttemptId() {
+    Map<String, String> properties = taskDescriptor.getProperties();
+    return properties == null ? null : properties.get(TaskProperties.TASK_ATTEMPT_ID);
+  }
+
+  private static String reportedAttemptId(OptimizingTaskResult result) {
+    return result.getSummary() == null
+        ? null
+        : result.getSummary().get(TaskProperties.TASK_ATTEMPT_ID);
+  }
+
+  private void persistTaskRuntime() {
+    doAs(OptimizingProcessMapper.class, mapper -> mapper.updateTaskRuntime(this));
+  }
+
+  public TaskQuota getCurrentQuota() {
+    if (startTime == AmoroServiceConstants.INVALID_TIME
+        || endTime == AmoroServiceConstants.INVALID_TIME) {
+      throw new IllegalStateException("start time or end time is not correctly set");
+    }
+    return new TaskQuota(this);
+  }
+
+  private static final Map<Status, Set<Status>> nextStatusMap =
+      ImmutableMap.<Status, Set<Status>>builder()
+          .put(Status.PLANNED, ImmutableSet.of(Status.SCHEDULED, Status.CANCELED))
+          .put(Status.SCHEDULED, ImmutableSet.of(Status.PLANNED, Status.ACKED, Status.CANCELED))
+          .put(
+              Status.ACKED,
+              ImmutableSet.of(Status.PLANNED, Status.SUCCESS, Status.FAILED, Status.CANCELED))
+          .put(Status.FAILED, ImmutableSet.of(Status.PLANNED))
+          .put(Status.CANCELED, ImmutableSet.of())
+          .put(Status.SUCCESS, ImmutableSet.of())
+          .build();
+
+  private class TaskStatusMachine {
+
+    public void accept(Status targetStatus) {
+      if (!getNext().contains(targetStatus)) {
+        throw new IllegalTaskStateException(taskId, status.name(), targetStatus.name());
+      }
+      status = targetStatus;
+    }
+
+    private Set<Status> getNext() {
+      return nextStatusMap.get(status);
+    }
+
+    public synchronized boolean tryAccepting(Status targetStatus) {
+      if (!getNext().contains(targetStatus)) {
+        return false;
+      }
+      status = targetStatus;
+      return true;
+    }
+  }
+
+  public enum Status {
+    PLANNED,
+    SCHEDULED,
+    ACKED,
+    FAILED,
+    SUCCESS,
+    CANCELED // If Optimizing process failed, all tasks will be CANCELED except for SUCCESS tasks
+  }
+
+  public static class TaskQuota {
+
+    private long processId;
+    private int taskId;
+    private int retryNum;
+    private long startTime;
+    private long endTime;
+    private String failReason;
+    private long tableId;
+
+    public TaskQuota() {}
+
+    public TaskQuota(TaskRuntime<?> task) {
+      this.startTime = task.getStartTime();
+      this.endTime = task.getEndTime();
+      this.processId = task.getTaskId().getProcessId();
+      this.taskId = task.getTaskId().getTaskId();
+      this.tableId = task.getTableId();
+      this.retryNum = task.getRetry();
+      this.failReason = task.getFailReason();
+    }
+
+    public long getStartTime() {
+      return startTime;
+    }
+
+    public long getProcessId() {
+      return processId;
+    }
+
+    public int getTaskId() {
+      return taskId;
+    }
+
+    public int getRetryNum() {
+      return retryNum;
+    }
+
+    public long getEndTime() {
+      return endTime;
+    }
+
+    public String getFailReason() {
+      return failReason;
+    }
+
+    public long getTableId() {
+      return tableId;
+    }
+
+    public long getQuotaTime(long calculatingStartTime) {
+      long lastingTime = endTime - Math.max(startTime, calculatingStartTime);
+      return Math.max(0, lastingTime);
+    }
+
+    public boolean checkExpired(long validTime) {
+      return endTime <= validTime;
+    }
+  }
+}

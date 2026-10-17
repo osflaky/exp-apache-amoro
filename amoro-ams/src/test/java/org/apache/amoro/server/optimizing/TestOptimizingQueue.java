@@ -1,0 +1,1132 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.amoro.server.optimizing;
+
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.GROUP_TAG;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_COMMITTING_TABLES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_CONFIG_INVALID;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_EXECUTING_TABLES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_EXECUTING_TASKS;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_IDLE_OPTIMIZERS;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_IDLE_TABLES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_MEMORY_BYTES_ALLOCATED;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_OPTIMIZER_INSTANCES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_PENDING_TABLES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_PENDING_TASKS;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_PLANING_TABLES;
+import static org.apache.amoro.server.optimizing.OptimizerGroupMetrics.OPTIMIZER_GROUP_THREADS;
+
+import org.apache.amoro.BasicTableTestHelper;
+import org.apache.amoro.OptimizerProperties;
+import org.apache.amoro.ServerTableIdentifier;
+import org.apache.amoro.TableFormat;
+import org.apache.amoro.TableTestHelper;
+import org.apache.amoro.api.OptimizerRegisterInfo;
+import org.apache.amoro.api.OptimizingTaskId;
+import org.apache.amoro.api.OptimizingTaskResult;
+import org.apache.amoro.catalog.BasicCatalogTestHelper;
+import org.apache.amoro.catalog.CatalogTestHelper;
+import org.apache.amoro.exception.TaskRuntimeException;
+import org.apache.amoro.io.MixedDataTestHelpers;
+import org.apache.amoro.metrics.Gauge;
+import org.apache.amoro.metrics.MetricKey;
+import org.apache.amoro.metrics.MetricRegistry;
+import org.apache.amoro.optimizing.RewriteFilesOutput;
+import org.apache.amoro.optimizing.TableOptimizing;
+import org.apache.amoro.optimizing.TaskProperties;
+import org.apache.amoro.process.ProcessStatus;
+import org.apache.amoro.resource.ResourceGroup;
+import org.apache.amoro.server.manager.MetricManager;
+import org.apache.amoro.server.optimizing.dra.DynamicAllocationState;
+import org.apache.amoro.server.resource.OptimizerInstance;
+import org.apache.amoro.server.resource.OptimizerThread;
+import org.apache.amoro.server.resource.QuotaProvider;
+import org.apache.amoro.server.table.AMSTableTestBase;
+import org.apache.amoro.server.table.DefaultTableRuntime;
+import org.apache.amoro.shade.guava32.com.google.common.collect.ImmutableMap;
+import org.apache.amoro.shade.guava32.com.google.common.collect.Lists;
+import org.apache.amoro.shade.guava32.com.google.common.collect.Maps;
+import org.apache.amoro.table.MixedTable;
+import org.apache.amoro.table.TableProperties;
+import org.apache.amoro.table.UnkeyedTable;
+import org.apache.amoro.utils.SerializationUtil;
+import org.apache.iceberg.AppendFiles;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.Record;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
+
+@RunWith(Parameterized.class)
+public class TestOptimizingQueue extends AMSTableTestBase {
+
+  private final Executor planExecutor = Executors.newSingleThreadExecutor();
+  private final QuotaProvider quotaProvider = resourceGroup -> 1;
+  private final long MAX_POLLING_TIME = 5000;
+
+  private final OptimizerThread optimizerThread =
+      new OptimizerThread(1, null) {
+
+        @Override
+        public String getToken() {
+          return "aah";
+        }
+      };
+
+  private final OptimizerThread optimizerThread2 =
+      new OptimizerThread(2, null) {
+
+        @Override
+        public String getToken() {
+          return "aah";
+        }
+      };
+
+  public TestOptimizingQueue(CatalogTestHelper catalogTestHelper, TableTestHelper tableTestHelper) {
+    super(catalogTestHelper, tableTestHelper, true);
+  }
+
+  @Parameterized.Parameters(name = "{0}, {1}")
+  public static Object[] parameters() {
+    return new Object[][] {
+      {new BasicCatalogTestHelper(TableFormat.ICEBERG), new BasicTableTestHelper(false, true)}
+    };
+  }
+
+  protected static ResourceGroup testResourceGroup() {
+    return new ResourceGroup.Builder("test", "local").build();
+  }
+
+  @Before
+  public void setUp() {
+    // Clean up any existing metrics for the test resource group before each test
+    // to avoid "Metric is already been registered" errors
+    MetricRegistry registry = MetricManager.getInstance().getGlobalRegistry();
+    String testGroupName = testResourceGroup().getName();
+
+    // Unregister all metrics for the test resource group
+    List<MetricKey> keysToRemove = new ArrayList<>();
+    for (MetricKey key : registry.getMetrics().keySet()) {
+      if (key.getDefine().getName().startsWith("optimizer_group_")
+          && testGroupName.equals(key.valueOfTag(GROUP_TAG))) {
+        keysToRemove.add(key);
+      }
+    }
+    keysToRemove.forEach(registry::unregister);
+  }
+
+  protected OptimizingQueue buildOptimizingGroupService(DefaultTableRuntime tableRuntime) {
+    return new OptimizingQueue(
+        CATALOG_MANAGER,
+        testResourceGroup(),
+        quotaProvider,
+        planExecutor,
+        Collections.singletonList(tableRuntime),
+        1);
+  }
+
+  private OptimizingQueue buildOptimizingGroupService() {
+    return new OptimizingQueue(
+        CATALOG_MANAGER,
+        testResourceGroup(),
+        quotaProvider,
+        planExecutor,
+        Collections.emptyList(),
+        1);
+  }
+
+  @Test
+  public void testPollNoTask() {
+    DefaultTableRuntime tableRuntimeMeta =
+        buildTableRuntimeMeta(OptimizingStatus.PENDING, defaultResourceGroup());
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntimeMeta);
+    Assert.assertNull(queue.pollTask(optimizerThread, 0));
+    queue.dispose();
+  }
+
+  @Test
+  public void testRefreshAndReleaseTable() {
+    OptimizingQueue queue = buildOptimizingGroupService();
+    Assert.assertEquals(0, queue.getSchedulingPolicy().getTableRuntimeMap().size());
+    DefaultTableRuntime tableRuntime =
+        buildTableRuntimeMeta(OptimizingStatus.IDLE, defaultResourceGroup());
+    queue.refreshTable(tableRuntime);
+    Assert.assertEquals(1, queue.getSchedulingPolicy().getTableRuntimeMap().size());
+    Assert.assertTrue(
+        queue.getSchedulingPolicy().getTableRuntimeMap().containsKey(serverTableIdentifier()));
+
+    queue.releaseTable(tableRuntime);
+    Assert.assertEquals(0, queue.getSchedulingPolicy().getTableRuntimeMap().size());
+
+    queue.refreshTable(tableRuntime);
+    Assert.assertEquals(1, queue.getSchedulingPolicy().getTableRuntimeMap().size());
+    queue.dispose();
+  }
+
+  @Test
+  public void testPollTask() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // 1.poll task
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+
+    Assert.assertNotNull(task);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+    Assert.assertNull(queue.pollTask(optimizerThread, 0));
+    queue.dispose();
+  }
+
+  @Test
+  public void testCollectDynamicAllocationLoad() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // Before any poll nothing has been planned: the PENDING table is the only demand signal —
+    // exactly what dynamic allocation must observe on a cold group with zero optimizers.
+    DynamicAllocationState.GroupLoad before = queue.collectDynamicAllocationLoad();
+    Assert.assertEquals(0, before.getBusyThreads());
+    Assert.assertEquals(0, before.getServiceablePlanned());
+    Assert.assertEquals(1, before.getPendingTables());
+
+    // A poll drives planning and takes the produced task: the thread is busy from SCHEDULED
+    // (not only from ACKED), and the table is no longer PENDING.
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+
+    DynamicAllocationState.GroupLoad after = queue.collectDynamicAllocationLoad();
+    Assert.assertEquals(1, after.getBusyThreads());
+    Assert.assertEquals(0, after.getServiceablePlanned());
+    Assert.assertEquals(0, after.getPendingTables());
+    queue.dispose();
+  }
+
+  @Test
+  public void testCollectDynamicAllocationLoadInFlightByToken() {
+    DefaultTableRuntime tableRuntime = initTableWithPartitionedFiles();
+    OptimizingQueue queue =
+        new OptimizingQueue(
+            CATALOG_MANAGER,
+            testResourceGroup(),
+            resourceGroup -> 2,
+            planExecutor,
+            Collections.singletonList(tableRuntime),
+            1);
+    OptimizerThread threadA =
+        new OptimizerThread(1, null) {
+          @Override
+          public String getToken() {
+            return "token-a";
+          }
+        };
+    OptimizerThread threadB =
+        new OptimizerThread(2, null) {
+          @Override
+          public String getToken() {
+            return "token-b";
+          }
+        };
+
+    // One task SCHEDULED on token-a while the rest stay PLANNED: only the occupying token is
+    // counted — PLANNED tasks carry no assignment and must not appear in the map.
+    TaskRuntime<?> task = queue.pollTask(threadA, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(
+        ImmutableMap.of("token-a", 1), queue.collectDynamicAllocationLoad().getInFlightByToken());
+
+    // ACKED still occupies the thread, so the token stays counted.
+    queue.ackTask(task.getTaskId(), threadA);
+    Assert.assertEquals(
+        ImmutableMap.of("token-a", 1), queue.collectDynamicAllocationLoad().getInFlightByToken());
+
+    // A second optimizer polling the remaining task is aggregated under its own token.
+    TaskRuntime<?> task2 = queue.pollTask(threadB, MAX_POLLING_TIME, true);
+    Assert.assertNotNull(task2);
+    Assert.assertEquals(
+        ImmutableMap.of("token-a", 1, "token-b", 1),
+        queue.collectDynamicAllocationLoad().getInFlightByToken());
+    queue.dispose();
+  }
+
+  @Test
+  public void testCollectDynamicAllocationLoadRecoversTaskTokens() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+    queue.dispose();
+
+    // Rebuild the queue from persistent state, as an AMS restart does: the recovered SCHEDULED
+    // task keeps its token, so the very first snapshot is accurate without any rebuild code.
+    OptimizingQueue restored = buildOptimizingGroupService(tableRuntime);
+    DynamicAllocationState.GroupLoad load = restored.collectDynamicAllocationLoad();
+    Assert.assertEquals(1, load.getBusyThreads());
+    Assert.assertEquals(ImmutableMap.of(optimizerThread.getToken(), 1), load.getInFlightByToken());
+    restored.dispose();
+  }
+
+  @Test
+  public void testPollTaskWithOverQuotaDisabled() {
+    DefaultTableRuntime tableRuntime = initTableWithPartitionedFiles();
+    OptimizingQueue queue =
+        new OptimizingQueue(
+            CATALOG_MANAGER,
+            testResourceGroup(),
+            resourceGroup -> 2,
+            planExecutor,
+            Collections.singletonList(tableRuntime),
+            1);
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME, false);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.ACKED).size());
+    Assert.assertNotNull(task);
+
+    // Use a different thread to avoid resetStaleTasksForThread resetting the ACKED task
+    TaskRuntime<?> task2 = queue.pollTask(optimizerThread2, MAX_POLLING_TIME, false);
+    Assert.assertNull(task2);
+
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, task.getStatus());
+
+    TaskRuntime<?> retryTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(retryTask);
+
+    queue.dispose();
+  }
+
+  @Test
+  public void testPollTaskWithOverQuotaEnabled() {
+    DefaultTableRuntime tableRuntime = initTableWithPartitionedFiles();
+    OptimizingQueue queue =
+        new OptimizingQueue(
+            CATALOG_MANAGER,
+            testResourceGroup(),
+            resourceGroup -> 2,
+            planExecutor,
+            Collections.singletonList(tableRuntime),
+            1);
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.ACKED).size());
+    Assert.assertNotNull(task);
+
+    // Use a different thread to avoid resetStaleTasksForThread resetting the ACKED task
+    TaskRuntime<?> task2 = queue.pollTask(optimizerThread2, MAX_POLLING_TIME, true);
+    Assert.assertNotNull(task2);
+
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, task.getStatus());
+    TaskRuntime<?> task4 = queue.pollTask(optimizerThread2, MAX_POLLING_TIME, false);
+    Assert.assertNull(task4);
+    TaskRuntime<?> retryTask = queue.pollTask(optimizerThread2, MAX_POLLING_TIME, true);
+    Assert.assertNotNull(retryTask);
+    queue.dispose();
+  }
+
+  @Test
+  public void testQuotaSchedulePolicy() throws InterruptedException {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+
+    OptimizingQueue queue =
+        new OptimizingQueue(
+            CATALOG_MANAGER,
+            testResourceGroup(),
+            resourceGroup -> 2,
+            planExecutor,
+            Collections.singletonList(tableRuntime),
+            1);
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.ACKED).size());
+    Assert.assertNotNull(task);
+    Assert.assertTrue(tableRuntime.getTableIdentifier().getId() == task.getTableId());
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, task.getStatus());
+    OptimizingProcess optimizingProcess = tableRuntime.getOptimizingProcess();
+    Assert.assertEquals(ProcessStatus.RUNNING, optimizingProcess.getStatus());
+    optimizingProcess.commit();
+    Assert.assertEquals(ProcessStatus.SUCCESS, optimizingProcess.getStatus());
+    Assert.assertNull(tableRuntime.getOptimizingProcess());
+
+    // waiting for min-plan-interval and minor-trigger-interval
+    Thread.sleep(500);
+    tableRuntime = initTableWithPartitionedFiles();
+    ServerTableIdentifier serverTableIdentifier =
+        ServerTableIdentifier.of(
+            org.apache.amoro.table.TableIdentifier.of(
+                serverTableIdentifier().getCatalog(), "db", "new_table"),
+            TableFormat.ICEBERG);
+    serverTableIdentifier.setId(100L);
+    DefaultTableRuntime tableRuntime2 = createTable(serverTableIdentifier);
+    queue.refreshTable(tableRuntime2);
+    queue.refreshTable(tableRuntime);
+
+    // Poll two tasks and verify they come from different tables
+    // The order may vary due to async planning, so we check both possibilities
+    TaskRuntime<?> task2 = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task2);
+    TaskRuntime<?> task3 = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task3);
+
+    // Verify that the two tasks come from the two different tables
+    long tableId1 = tableRuntime.getTableIdentifier().getId();
+    long tableId2 = tableRuntime2.getTableIdentifier().getId();
+    long task2TableId = task2.getTableId();
+    long task3TableId = task3.getTableId();
+
+    Assert.assertTrue(
+        "Task2 should come from one of the two tables",
+        task2TableId == tableId1 || task2TableId == tableId2);
+    Assert.assertTrue(
+        "Task3 should come from one of the two tables",
+        task3TableId == tableId1 || task3TableId == tableId2);
+    Assert.assertNotEquals(
+        "Task2 and Task3 should come from different tables", task2TableId, task3TableId);
+    queue.dispose();
+    tableRuntime2.dispose();
+  }
+
+  @Test
+  public void testRetryTask() {
+    DefaultTableRuntime tableRuntimeMeta = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntimeMeta);
+
+    // 1.poll task
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+
+    for (int i = 0; i < TableProperties.SELF_OPTIMIZING_EXECUTE_RETRY_NUMBER_DEFAULT; i++) {
+      queue.retryTask(task);
+      TaskRuntime<?> retryTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+      Assert.assertEquals(retryTask.getTaskId(), task.getTaskId());
+      queue.ackTask(task.getTaskId(), optimizerThread);
+      queue.completeTask(
+          optimizerThread,
+          buildOptimizingTaskFailed(task.getTaskId(), optimizerThread.getThreadId()));
+      Assert.assertEquals(TaskRuntime.Status.PLANNED, task.getStatus());
+    }
+
+    queue.retryTask(task);
+    TaskRuntime<?> retryTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertEquals(retryTask.getTaskId(), task.getTaskId());
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskFailed(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.FAILED, task.getStatus());
+    queue.dispose();
+  }
+
+  // Issue #4235 fix: when the same optimizer thread polls again while one of its tasks is still
+  // ACKED, pollTask -> resetStaleTasksForThread resets that task. With more than one task in the
+  // process, the repoll schedules a *different* task, leaving the original PLANNED with token ==
+  // null. The optimizer's in-flight ack for the reset task is rejected on purpose so the optimizer
+  // skips executing this obsolete round; the task stays PLANNED to be re-polled by another thread.
+  @Test
+  public void testStaleAckAfterRepollIsRejected() {
+    DefaultTableRuntime tableRuntime = initTableWithPartitionedFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // 1. poll + ack task A -> ACKED (optimizer started executing it)
+    TaskRuntime<?> taskA = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(taskA);
+    queue.ackTask(taskA.getTaskId(), optimizerThread);
+    Assert.assertEquals(TaskRuntime.Status.ACKED, taskA.getStatus());
+
+    // 2. the same thread polls again; resetStaleTasksForThread resets the still-executing task A
+    // and
+    //    the repoll schedules a different task B. Task A is left PLANNED with no token.
+    TaskRuntime<?> taskB = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(taskB);
+    Assert.assertNotEquals(taskA.getTaskId(), taskB.getTaskId());
+    Assert.assertEquals(TaskRuntime.Status.PLANNED, taskA.getStatus());
+    Assert.assertNull(taskA.getToken());
+
+    // 3. task A's in-flight ack is rejected so the optimizer skips this stale round (no duplicate
+    //    execution). The exception still carries the message the optimizer client recognizes.
+    TaskRuntimeException e =
+        Assert.assertThrows(
+            TaskRuntimeException.class, () -> queue.ackTask(taskA.getTaskId(), optimizerThread));
+    Assert.assertTrue(e.getMessage().contains("has been reset or not yet scheduled"));
+
+    // task A remains PLANNED, still waiting to be re-polled and re-executed
+    Assert.assertEquals(TaskRuntime.Status.PLANNED, taskA.getStatus());
+    queue.dispose();
+  }
+
+  // Issue #4235 fix, single-task variant: the repoll re-schedules the *same* task (its token is
+  // restored), so the in-flight SUCCESS result for the previous run must be recognized as stale and
+  // ignored -- not blow up the SCHEDULED -> SUCCESS transition. The freshly re-scheduled round is
+  // left intact to be acked and completed normally.
+  @Test
+  public void testStaleCompleteAfterRepollIsIgnored() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(TaskRuntime.Status.ACKED, task.getStatus());
+
+    // same thread polls again -> resetStaleTasksForThread resets the executing task, then the
+    // single
+    // task is re-scheduled back to the same thread (now SCHEDULED again, awaiting its own ack).
+    TaskRuntime<?> repolled = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertSame(task, repolled);
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+
+    // the previous run's SUCCESS result arrives; it is stale and must be ignored (no exception)
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+
+    // the current re-scheduled round is untouched: still SCHEDULED, awaiting its own ack
+    Assert.assertEquals(TaskRuntime.Status.SCHEDULED, task.getStatus());
+    queue.dispose();
+  }
+
+  // The (token, threadId, status) checks alone cannot tell two attempts of the same task on the
+  // same optimizer thread apart: once the rescheduled round is ACKED again, a delayed completion
+  // of the previous attempt matches all three. Every schedule therefore stamps an attempt id into
+  // the task properties, and a completion echoing a different attempt id must be ignored.
+  @Test
+  public void testStaleCompleteFromPreviousAttemptIsIgnored() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // 1. first attempt: poll + ack, the optimizer starts executing
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    String firstAttempt =
+        task.extractProtocolTask().getProperties().get(TaskProperties.TASK_ATTEMPT_ID);
+    Assert.assertNotNull(firstAttempt);
+    queue.ackTask(task.getTaskId(), optimizerThread);
+
+    // 2. the same thread polls again: the task is reset and re-scheduled to the SAME thread with
+    //    a new attempt id, then the second attempt is acked -> (token, threadId, ACKED) is now
+    //    identical to what the first attempt's completion will carry
+    TaskRuntime<?> repolled = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertSame(task, repolled);
+    String secondAttempt =
+        task.extractProtocolTask().getProperties().get(TaskProperties.TASK_ATTEMPT_ID);
+    Assert.assertNotEquals(firstAttempt, secondAttempt);
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(TaskRuntime.Status.ACKED, task.getStatus());
+
+    // 3. the delayed completion of the FIRST attempt arrives; only the echoed attempt id can
+    //    expose it as stale -> ignored, the second attempt keeps executing
+    OptimizingTaskResult staleResult =
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId());
+    staleResult.setSummary(ImmutableMap.of(TaskProperties.TASK_ATTEMPT_ID, firstAttempt));
+    queue.completeTask(optimizerThread, staleResult);
+    Assert.assertEquals(TaskRuntime.Status.ACKED, task.getStatus());
+
+    // 4. the second attempt's own completion (echoing the current attempt id) is accepted
+    OptimizingTaskResult currentResult =
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId());
+    currentResult.setSummary(ImmutableMap.of(TaskProperties.TASK_ATTEMPT_ID, secondAttempt));
+    queue.completeTask(optimizerThread, currentResult);
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, task.getStatus());
+    queue.dispose();
+  }
+
+  @Test
+  public void testCommitTask() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    Assert.assertEquals(0, queue.collectTasks().size());
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.ACKED).size());
+    Assert.assertNotNull(task);
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, task.getStatus());
+
+    // 7.commit
+    OptimizingProcess optimizingProcess = tableRuntime.getOptimizingProcess();
+    Assert.assertEquals(ProcessStatus.RUNNING, optimizingProcess.getStatus());
+    optimizingProcess.commit();
+    Assert.assertEquals(ProcessStatus.SUCCESS, optimizingProcess.getStatus());
+    Assert.assertNull(tableRuntime.getOptimizingProcess());
+
+    // 8.commit again, throw exceptions, and status not changed.
+    Assert.assertThrows(IllegalStateException.class, optimizingProcess::commit);
+    Assert.assertEquals(ProcessStatus.SUCCESS, optimizingProcess.getStatus());
+
+    Assert.assertEquals(0, queue.collectTasks().size());
+    queue.dispose();
+  }
+
+  @Test
+  public void testCommitTaskWithFailed() {
+    DefaultTableRuntime tableRuntime = initTableWithPartitionedFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    Assert.assertEquals(0, queue.collectTasks().size());
+
+    TaskRuntime<?> firstTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    queue.ackTask(firstTask.getTaskId(), optimizerThread);
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.ACKED).size());
+    Assert.assertNotNull(firstTask);
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(firstTask.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.SUCCESS, firstTask.getStatus());
+
+    queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+
+    for (int i = 0; i < TableProperties.SELF_OPTIMIZING_EXECUTE_RETRY_NUMBER_DEFAULT; i++) {
+      queue.retryTask(task);
+      TaskRuntime<?> retryTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+      Assert.assertEquals(retryTask.getTaskId(), task.getTaskId());
+      queue.ackTask(task.getTaskId(), optimizerThread);
+      queue.completeTask(
+          optimizerThread,
+          buildOptimizingTaskFailed(task.getTaskId(), optimizerThread.getThreadId()));
+      Assert.assertEquals(TaskRuntime.Status.PLANNED, task.getStatus());
+    }
+
+    queue.retryTask(task);
+    TaskRuntime<?> retryTask = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertEquals(retryTask.getTaskId(), task.getTaskId());
+    queue.ackTask(retryTask.getTaskId(), optimizerThread);
+
+    OptimizingProcess optimizingProcess = tableRuntime.getOptimizingProcess();
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskFailed(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(TaskRuntime.Status.FAILED, task.getStatus());
+    optimizingProcess.commit();
+    Assert.assertEquals(ProcessStatus.FAILED, optimizingProcess.getStatus());
+    Assert.assertNull(tableRuntime.getOptimizingProcess());
+    Assert.assertEquals(0, queue.collectTasks().size());
+    queue.dispose();
+  }
+
+  @Test
+  public void testCollectingTasks() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    Assert.assertEquals(0, queue.collectTasks().size());
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(1, queue.collectTasks().size());
+    Assert.assertEquals(
+        1, queue.collectTasks(t -> t.getStatus() == TaskRuntime.Status.SCHEDULED).size());
+    queue.dispose();
+  }
+
+  @Test
+  public void testTaskAndTableMetrics() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    MetricRegistry registry = MetricManager.getInstance().getGlobalRegistry();
+    Map<String, String> tagValues = ImmutableMap.of(GROUP_TAG, testResourceGroup().getName());
+
+    Gauge<Integer> queueTasksGauge =
+        (Gauge<Integer>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_PENDING_TASKS, tagValues));
+    Gauge<Integer> executingTasksGauge =
+        (Gauge<Integer>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_EXECUTING_TASKS, tagValues));
+    Gauge<Long> planingTablesGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_PLANING_TABLES, tagValues));
+    Gauge<Long> pendingTablesGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_PENDING_TABLES, tagValues));
+    Gauge<Long> executingTablesGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_EXECUTING_TABLES, tagValues));
+    Gauge<Long> idleTablesGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_IDLE_TABLES, tagValues));
+    Gauge<Long> committingTablesGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_COMMITTING_TABLES, tagValues));
+
+    Assert.assertEquals(0, queueTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, planingTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, pendingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, idleTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, committingTablesGauge.getValue().longValue());
+
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(1, queueTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, planingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, pendingTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, executingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, idleTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, committingTablesGauge.getValue().longValue());
+
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    Assert.assertEquals(0, queueTasksGauge.getValue().longValue());
+    Assert.assertEquals(1, executingTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, planingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, pendingTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, executingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, idleTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, committingTablesGauge.getValue().longValue());
+
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+    Assert.assertEquals(0, queueTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, planingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, pendingTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, executingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, idleTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, committingTablesGauge.getValue().longValue());
+
+    OptimizingProcess optimizingProcess = tableRuntime.getOptimizingProcess();
+    optimizingProcess.commit();
+    Assert.assertEquals(0, queueTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTasksGauge.getValue().longValue());
+    Assert.assertEquals(0, planingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, pendingTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, executingTablesGauge.getValue().longValue());
+    Assert.assertEquals(1, idleTablesGauge.getValue().longValue());
+    Assert.assertEquals(0, committingTablesGauge.getValue().longValue());
+    queue.dispose();
+  }
+
+  @Test
+  public void testAddAndRemoveOptimizers() {
+
+    OptimizingQueue queue = buildOptimizingGroupService();
+    MetricRegistry registry = MetricManager.getInstance().getGlobalRegistry();
+    Map<String, String> tagValues = ImmutableMap.of(GROUP_TAG, testResourceGroup().getName());
+    OptimizerRegisterInfo optimizerRegisterInfo =
+        new OptimizerRegisterInfo(
+            2, 2048, System.currentTimeMillis(), testResourceGroup().getName());
+    OptimizerInstance optimizer = new OptimizerInstance(optimizerRegisterInfo, "test_container");
+
+    Gauge<Integer> optimizerCountGauge =
+        (Gauge<Integer>)
+            registry
+                .getMetrics()
+                .get(new MetricKey(OPTIMIZER_GROUP_OPTIMIZER_INSTANCES, tagValues));
+    Gauge<Long> optimizerMemoryGauge =
+        (Gauge<Long>)
+            registry
+                .getMetrics()
+                .get(new MetricKey(OPTIMIZER_GROUP_MEMORY_BYTES_ALLOCATED, tagValues));
+    Gauge<Long> optimizerThreadsGauge =
+        (Gauge<Long>) registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_THREADS, tagValues));
+
+    queue.addOptimizer(optimizer);
+    Assert.assertEquals(1, optimizerCountGauge.getValue().longValue());
+    Assert.assertEquals((long) 2048 * 1024 * 1024, optimizerMemoryGauge.getValue().longValue());
+    Assert.assertEquals(2, optimizerThreadsGauge.getValue().longValue());
+
+    queue.removeOptimizer(optimizer);
+    Assert.assertEquals(0, optimizerCountGauge.getValue().longValue());
+    Assert.assertEquals(0, optimizerMemoryGauge.getValue().longValue());
+    Assert.assertEquals(0, optimizerThreadsGauge.getValue().longValue());
+    queue.dispose();
+  }
+
+  /** An optimizer is idle while it has no in-flight (SCHEDULED/ACKED) task. */
+  @Test
+  public void testIdleOptimizersMetric() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    MetricRegistry registry = MetricManager.getInstance().getGlobalRegistry();
+    Map<String, String> tagValues = ImmutableMap.of(GROUP_TAG, testResourceGroup().getName());
+    Gauge<Long> idleOptimizersGauge =
+        (Gauge<Long>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_IDLE_OPTIMIZERS, tagValues));
+
+    OptimizerRegisterInfo registerInfo =
+        new OptimizerRegisterInfo(
+            2, 2048, System.currentTimeMillis(), testResourceGroup().getName());
+    final OptimizerInstance optimizer = new OptimizerInstance(registerInfo, "test_container");
+    queue.addOptimizer(optimizer);
+    Assert.assertEquals(1, idleOptimizersGauge.getValue().longValue());
+
+    OptimizerThread thread =
+        new OptimizerThread(1, null) {
+          @Override
+          public String getToken() {
+            return optimizer.getToken();
+          }
+        };
+    Assert.assertNotNull(queue.pollTask(thread, MAX_POLLING_TIME));
+    Assert.assertEquals(
+        "an optimizer holding an in-flight task is not idle",
+        0,
+        idleOptimizersGauge.getValue().longValue());
+
+    queue.removeOptimizer(optimizer);
+    queue.dispose();
+  }
+
+  /** The gauge flips when a config update leaves an opted-in group with an invalid DRA config. */
+  @Test
+  public void testConfigInvalidMetric() {
+    OptimizingQueue queue = buildOptimizingGroupService();
+    MetricRegistry registry = MetricManager.getInstance().getGlobalRegistry();
+    Map<String, String> tagValues = ImmutableMap.of(GROUP_TAG, testResourceGroup().getName());
+    Gauge<Integer> configInvalidGauge =
+        (Gauge<Integer>)
+            registry.getMetrics().get(new MetricKey(OPTIMIZER_GROUP_CONFIG_INVALID, tagValues));
+    Assert.assertEquals(0, configInvalidGauge.getValue().intValue());
+
+    Map<String, String> props = Maps.newHashMap();
+    props.put(OptimizerProperties.DYNAMIC_ALLOCATION_ENABLED, "true");
+    // Enabled without max-parallelism: invalid, running under the startup fail-safe fallback.
+    queue.updateOptimizerGroup(
+        new ResourceGroup.Builder(testResourceGroup().getName(), "local")
+            .addProperties(props)
+            .build());
+    Assert.assertEquals(1, configInvalidGauge.getValue().intValue());
+    queue.dispose();
+  }
+
+  @Test
+  public void testProcessCloseKeepsLastOptimizedSnapshotId() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    long snapshotIdBeforePlanning = tableRuntime.getLastOptimizedSnapshotId();
+    long changeSnapshotIdBeforePlanning = tableRuntime.getLastOptimizedChangeSnapshotId();
+
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // Poll task to trigger planning → process creation
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+
+    OptimizingProcess process = tableRuntime.getOptimizingProcess();
+    Assert.assertNotNull(process);
+    Assert.assertEquals(ProcessStatus.RUNNING, process.getStatus());
+
+    // Close process without success (simulates group change / forced termination)
+    process.close(false);
+
+    Assert.assertTrue(process.isClosed());
+
+    // lastOptimizedSnapshotId and lastOptimizedChangeSnapshotId should NOT be updated
+    Assert.assertEquals(snapshotIdBeforePlanning, tableRuntime.getLastOptimizedSnapshotId());
+    Assert.assertEquals(
+        changeSnapshotIdBeforePlanning, tableRuntime.getLastOptimizedChangeSnapshotId());
+    Assert.assertEquals(OptimizingStatus.IDLE, tableRuntime.getOptimizingStatus());
+    Assert.assertNull(tableRuntime.getOptimizingProcess());
+    queue.dispose();
+  }
+
+  @Test
+  public void testTableRescheduledAfterProcessClose() {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+
+    // Poll task to trigger planning → process creation
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+
+    OptimizingProcess process = tableRuntime.getOptimizingProcess();
+    Assert.assertNotNull(process);
+
+    // Force close instead of commit (simulates group change)
+    process.close(false);
+    Assert.assertEquals(OptimizingStatus.IDLE, tableRuntime.getOptimizingStatus());
+
+    // Verify snapshot marker was not updated — key condition for isTablePending()
+    Assert.assertNotEquals(
+        tableRuntime.getLastOptimizedSnapshotId(), tableRuntime.getCurrentSnapshotId());
+
+    // Simulate setPendingInput() transitioning IDLE → PENDING (done by evaluator in production)
+    tableRuntime
+        .store()
+        .begin()
+        .updateStatusCode(code -> OptimizingStatus.PENDING.getCode())
+        .commit();
+    Assert.assertEquals(OptimizingStatus.PENDING, tableRuntime.getOptimizingStatus());
+
+    // Set minPlanInterval to 0 so the table is immediately eligible for re-planning
+    tableRuntime
+        .store()
+        .begin()
+        .updateTableConfig(
+            config -> config.put(TableProperties.SELF_OPTIMIZING_MIN_PLAN_INTERVAL, "0"))
+        .commit();
+
+    // Build a new queue with the PENDING table — scheduler should NOT skip it
+    queue.dispose();
+    OptimizingQueue queue2 = buildOptimizingGroupService(tableRuntime);
+    TaskRuntime<?> task2 = queue2.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task2);
+    queue2.dispose();
+  }
+
+  @Test
+  public void testReleaseOrphanedPlanningTableOnRestart() {
+    // Scenario: Table config was changed (optimizer group: "old_group" -> "default"),
+    // the optimizing process was closed but table runtime is persisted with "old_group" and
+    // PLANNING status
+    ResourceGroup oldGroup = new ResourceGroup.Builder("old_group", "local").build();
+    // reset optimizer group to "default" to simulate the scenario where the self-optimizing configs
+    // have been cleared
+    DefaultTableRuntime tableRuntime =
+        buildTableRuntimeMeta(OptimizingStatus.PLANNING, defaultResourceGroup());
+    Assert.assertEquals(OptimizingStatus.PLANNING, tableRuntime.getOptimizingStatus());
+    Assert.assertEquals("default", tableRuntime.getGroupName());
+
+    List<DefaultTableRuntime> released =
+        simulateLoadOptimizingQueuesForNonExistentGroup(
+            Collections.singletonList(tableRuntime), oldGroup);
+
+    Assert.assertEquals(1, released.size());
+    Assert.assertEquals(OptimizingStatus.IDLE, tableRuntime.getOptimizingStatus());
+  }
+
+  @Test
+  public void testReleaseOrphanedPendingTableOnRestart() {
+    // Scenario: Table config was changed (optimizer group: "old_group" -> "default"),
+    // the optimizing process was closed but table runtime is persisted with "default" and PENDING
+    // status
+    ResourceGroup oldGroup = new ResourceGroup.Builder("old_group", "local").build();
+    // reset optimizer group to "default" to simulate the scenario where the self-optimizing configs
+    // have been cleared
+    DefaultTableRuntime tableRuntime =
+        buildTableRuntimeMeta(OptimizingStatus.PENDING, defaultResourceGroup());
+    Assert.assertEquals(OptimizingStatus.PENDING, tableRuntime.getOptimizingStatus());
+    Assert.assertEquals("default", tableRuntime.getGroupName());
+
+    List<DefaultTableRuntime> released =
+        simulateLoadOptimizingQueuesForNonExistentGroup(
+            Collections.singletonList(tableRuntime), oldGroup);
+
+    Assert.assertEquals(1, released.size());
+    Assert.assertEquals(OptimizingStatus.IDLE, tableRuntime.getOptimizingStatus());
+  }
+
+  @Test
+  public void testInFlightCounterEntryRemovedAfterTaskCompletes() throws Exception {
+    DefaultTableRuntime tableRuntime = initTableWithFiles();
+    OptimizingQueue queue = buildOptimizingGroupService(tableRuntime);
+    TaskRuntime<?> task = queue.pollTask(optimizerThread, MAX_POLLING_TIME);
+    Assert.assertNotNull(task);
+    Assert.assertEquals(1, readOptimizingTasksMapSize(queue));
+
+    queue.ackTask(task.getTaskId(), optimizerThread);
+    queue.completeTask(
+        optimizerThread,
+        buildOptimizingTaskResult(task.getTaskId(), optimizerThread.getThreadId()));
+
+    Assert.assertEquals(0, readOptimizingTasksMapSize(queue));
+    queue.dispose();
+  }
+
+  protected DefaultTableRuntime initTableWithFiles() {
+    MixedTable mixedTable =
+        (MixedTable) tableService().loadTable(serverTableIdentifier()).originalTable();
+    mixedTable
+        .updateProperties()
+        .set(TableProperties.SELF_OPTIMIZING_MIN_PLAN_INTERVAL, "10")
+        .set(TableProperties.SELF_OPTIMIZING_MINOR_TRIGGER_INTERVAL, "10")
+        .commit();
+    appendData(mixedTable.asUnkeyedTable(), 1);
+    appendData(mixedTable.asUnkeyedTable(), 2);
+    DefaultTableRuntime tableRuntime =
+        buildTableRuntimeMeta(OptimizingStatus.PENDING, defaultResourceGroup());
+
+    tableRuntime.refresh(tableService().loadTable(serverTableIdentifier()));
+    return tableRuntime;
+  }
+
+  protected DefaultTableRuntime initTableWithPartitionedFiles() {
+    MixedTable mixedTable =
+        (MixedTable) tableService().loadTable(serverTableIdentifier()).originalTable();
+    appendPartitionedData(mixedTable.asUnkeyedTable(), 1);
+    appendPartitionedData(mixedTable.asUnkeyedTable(), 2);
+    DefaultTableRuntime tableRuntime =
+        buildTableRuntimeMeta(OptimizingStatus.PENDING, defaultResourceGroup());
+
+    tableRuntime.refresh(tableService().loadTable(serverTableIdentifier()));
+    return tableRuntime;
+  }
+
+  private DefaultTableRuntime buildTableRuntimeMeta(
+      OptimizingStatus status, ResourceGroup resourceGroup) {
+    DefaultTableRuntime tableRuntime =
+        (DefaultTableRuntime) tableService().getRuntime(serverTableIdentifier().getId());
+    tableRuntime
+        .store()
+        .begin()
+        .updateStatusCode(code -> status.getCode())
+        .updateGroup(any -> resourceGroup.getName())
+        .commit();
+    return tableRuntime;
+  }
+
+  private void appendPartitionedData(UnkeyedTable table, int id) {
+    ArrayList<Record> newRecords =
+        Lists.newArrayList(
+            MixedDataTestHelpers.createRecord(
+                table.schema(), id, "111", 0L, "2022-01-01T12:00:00"));
+    newRecords.add(
+        MixedDataTestHelpers.createRecord(table.schema(), id, "222", 0L, "2022-01-02T12:00:00"));
+    newRecords.add(
+        MixedDataTestHelpers.createRecord(table.schema(), id, "333", 0L, "2022-01-03T12:00:00"));
+    List<DataFile> dataFiles = MixedDataTestHelpers.writeBaseStore(table, 0L, newRecords, false);
+    AppendFiles appendFiles = table.newAppend();
+    dataFiles.forEach(appendFiles::appendFile);
+    appendFiles.commit();
+  }
+
+  private void appendData(UnkeyedTable table, int id) {
+    ArrayList<Record> newRecords =
+        Lists.newArrayList(
+            MixedDataTestHelpers.createRecord(
+                table.schema(), id, "111", 0L, "2022-01-01T12:00:00"));
+    List<DataFile> dataFiles = MixedDataTestHelpers.writeBaseStore(table, 0L, newRecords, false);
+    AppendFiles appendFiles = table.newAppend();
+    dataFiles.forEach(appendFiles::appendFile);
+    appendFiles.commit();
+  }
+
+  private DefaultTableRuntime createTable(ServerTableIdentifier serverTableIdentifier) {
+    org.apache.iceberg.catalog.Catalog catalog =
+        catalogTestHelper().buildIcebergCatalog(catalogMeta());
+    catalog.createTable(
+        TableIdentifier.of(
+            serverTableIdentifier.getDatabase(), serverTableIdentifier.getTableName()),
+        tableTestHelper().tableSchema(),
+        tableTestHelper().partitionSpec(),
+        tableTestHelper().tableProperties());
+    exploreTableRuntimes();
+    serverTableIdentifier =
+        tableManager()
+            .getServerTableIdentifier(serverTableIdentifier.getIdentifier().buildTableIdentifier());
+
+    MixedTable mixedTable =
+        (MixedTable) tableService().loadTable(serverTableIdentifier).originalTable();
+    appendPartitionedData(mixedTable.asUnkeyedTable(), 1);
+    appendPartitionedData(mixedTable.asUnkeyedTable(), 2);
+
+    DefaultTableRuntime tableRuntime =
+        (DefaultTableRuntime) tableService().getRuntime(serverTableIdentifier.getId());
+
+    tableRuntime
+        .store()
+        .begin()
+        .updateGroup(any -> defaultResourceGroup().getName())
+        .updateStatusCode(any -> OptimizingStatus.PENDING.getCode())
+        .commit();
+
+    tableRuntime.refresh(tableService().loadTable(serverTableIdentifier));
+
+    return tableRuntime;
+  }
+
+  private OptimizingTaskResult buildOptimizingTaskResult(OptimizingTaskId taskId, int threadId) {
+    TableOptimizing.OptimizingOutput output = new RewriteFilesOutput(null, null, null);
+    OptimizingTaskResult optimizingTaskResult = new OptimizingTaskResult(taskId, threadId);
+    optimizingTaskResult.setTaskOutput(SerializationUtil.simpleSerialize(output));
+    return optimizingTaskResult;
+  }
+
+  private int readOptimizingTasksMapSize(OptimizingQueue queue) throws Exception {
+    Field field = OptimizingQueue.class.getDeclaredField("optimizingTasksMap");
+    field.setAccessible(true);
+    return ((Map<?, ?>) field.get(queue)).size();
+  }
+
+  /**
+   * Simulate the loadOptimizingQueues logic: tables whose persisted optimizer group no longer
+   * exists (e.g., table config changed from an old deleted group to "default", but AMS restarted
+   * before the optimizing process was closed) remain in the leftover groupToTableRuntimes map.
+   * These PLANNING/PENDING tables should be released to IDLE via completeEmptyProcess().
+   */
+  private List<DefaultTableRuntime> simulateLoadOptimizingQueuesForNonExistentGroup(
+      List<DefaultTableRuntime> tableRuntimes, ResourceGroup resourceGroup) {
+    // Only the created resource group is returned
+    List<ResourceGroup> existingGroups = Collections.singletonList(resourceGroup);
+
+    // Group tables by their persisted optimizer group
+    Map<String, List<DefaultTableRuntime>> groupToTableRuntimes =
+        tableRuntimes.stream().collect(Collectors.groupingBy(DefaultTableRuntime::getGroupName));
+
+    // Remove groups that exist — same logic as loadOptimizingQueues
+    existingGroups.forEach(group -> groupToTableRuntimes.remove(group.getName()));
+
+    // Release PLANNING/PENDING tables in non-existent groups — same logic as loadOptimizingQueues
+    List<DefaultTableRuntime> released = new ArrayList<>();
+    groupToTableRuntimes.forEach(
+        (groupName, trs) ->
+            trs.stream()
+                .filter(
+                    tr ->
+                        tr.getOptimizingStatus() == OptimizingStatus.PLANNING
+                            || tr.getOptimizingStatus() == OptimizingStatus.PENDING)
+                .forEach(
+                    tr -> {
+                      tr.completeEmptyProcess();
+                      released.add(tr);
+                    }));
+    return released;
+  }
+
+  private OptimizingTaskResult buildOptimizingTaskFailed(OptimizingTaskId taskId, int threadId) {
+    OptimizingTaskResult optimizingTaskResult = new OptimizingTaskResult(taskId, threadId);
+    optimizingTaskResult.setErrorMessage("error");
+    return optimizingTaskResult;
+  }
+}

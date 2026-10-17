@@ -1,0 +1,365 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.amoro.client;
+
+import org.apache.amoro.Constants;
+import org.apache.amoro.properties.AmsHAProperties;
+import org.apache.amoro.shade.guava32.com.google.common.base.MoreObjects;
+import org.apache.amoro.shade.zookeeper3.org.apache.zookeeper.KeeperException;
+import org.apache.amoro.utils.JacksonUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.security.auth.Subject;
+import javax.security.auth.login.LoginContext;
+import javax.security.auth.login.LoginException;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class AmsThriftUrl {
+  public static final String PARAM_SOCKET_TIMEOUT = "socketTimeout";
+  public static final int DEFAULT_SOCKET_TIMEOUT = 5000;
+  public static final String ZOOKEEPER_FLAG = "zookeeper";
+  public static final String THRIFT_URL_FORMAT = "thrift://%s:%d/%s%s";
+  public static final int MAX_RETRIES = 3;
+  private static final String THRIFT_SCHEME = "thrift";
+  private static final String ZOOKEEPER_SCHEME_PREFIX = ZOOKEEPER_FLAG + ":";
+  private static final int MAX_PORT = 65535;
+  private static final Logger logger = LoggerFactory.getLogger(AmsThriftUrl.class);
+  private static final Pattern PATTERN =
+      Pattern.compile("zookeeper://(\\S+)/([\\w-]+)", Pattern.CASE_INSENSITIVE);
+  private final String schema;
+  private final String host;
+  private final int port;
+  private final String catalogName;
+  private final int socketTimeout;
+
+  // origin url before parse
+  private final String url;
+
+  private AmsThriftUrl(
+      String schema, String host, int port, String catalogName, int socketTimeout, String url) {
+    this.schema = schema;
+    this.host = host;
+    this.port = port;
+    this.catalogName = catalogName;
+    this.socketTimeout = socketTimeout;
+    this.url = url;
+  }
+
+  /**
+   * parse thrift url, now support thrift://host:port/{catalogName} and
+   * zookeeper://host:port/{cluster}/{catalogName} . parse to AmsThriftUrl that contains properties
+   * schema, host, port, catalogName, socketTimeout, url.
+   *
+   * @param url - thrift url
+   * @return -
+   */
+  public static AmsThriftUrl parse(String url, String serviceName) {
+    if (url == null) {
+      throw new IllegalArgumentException("thrift url is null");
+    }
+    if (url.regionMatches(true, 0, ZOOKEEPER_SCHEME_PREFIX, 0, ZOOKEEPER_SCHEME_PREFIX.length())) {
+      return parserZookeeperUrl(url, serviceName);
+    } else {
+      return parserThriftUrl(url);
+    }
+  }
+
+  private static AmsThriftUrl parserThriftUrl(String url) {
+    try {
+      URI uri = new URI(url);
+      String schema = uri.getScheme();
+      if (!THRIFT_SCHEME.equalsIgnoreCase(schema)) {
+        throw new IllegalArgumentException(
+            String.format("Unsupported thrift URL scheme '%s' in URL: %s", schema, url));
+      }
+
+      uri = uri.parseServerAuthority();
+      String host = uri.getHost();
+      if (host == null || host.isEmpty()) {
+        throw new IllegalArgumentException(String.format("Missing host in thrift URL: %s", url));
+      }
+
+      int port = uri.getPort();
+      if (port == -1) {
+        throw new IllegalArgumentException(String.format("Missing port in thrift URL: %s", url));
+      } else if (port <= 0 || port > MAX_PORT) {
+        throw new IllegalArgumentException(
+            String.format("Invalid port in thrift URL, expected 1-%d: %s", MAX_PORT, url));
+      }
+
+      String path = uri.getPath();
+      if (path != null && path.startsWith("/")) {
+        path = path.substring(1);
+      }
+      String catalogName = path;
+      return new AmsThriftUrl(
+          THRIFT_SCHEME, host, port, catalogName, parseSocketTimeout(uri.getQuery()), url);
+    } catch (URISyntaxException e) {
+      throw new IllegalArgumentException(
+          String.format("Invalid thrift URL '%s': %s", url, e.getMessage()), e);
+    }
+  }
+
+  private static int parseSocketTimeout(String query) {
+    int socketTimeout = DEFAULT_SOCKET_TIMEOUT;
+    if (query != null) {
+      for (String paramExpression : query.split("&")) {
+        String[] paramSplit = paramExpression.split("=");
+        if (paramSplit.length == 2 && paramSplit[0].equalsIgnoreCase(PARAM_SOCKET_TIMEOUT)) {
+          try {
+            socketTimeout = Integer.parseInt(paramSplit[1]);
+          } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                String.format("Invalid socketTimeout value '%s'", paramSplit[1]), e);
+          }
+        }
+      }
+    }
+    return socketTimeout;
+  }
+
+  private static AmsThriftUrl parserZookeeperUrl(String url, String serviceName) {
+    String thriftUrl = url;
+    String query = "";
+    if (url.contains("?")) {
+      query = url.substring(url.indexOf("?"));
+      thriftUrl = url.substring(0, url.indexOf("?"));
+    }
+    Matcher m = PATTERN.matcher(thriftUrl);
+    if (m.matches()) {
+      String zkServerAddress;
+      String cluster;
+      String catalog = "";
+      if (m.group(1).contains("/")) {
+        zkServerAddress = m.group(1).substring(0, m.group(1).indexOf("/"));
+        cluster = m.group(1).substring(m.group(1).indexOf("/") + 1);
+        catalog = m.group(2);
+      } else {
+        zkServerAddress = m.group(1);
+        cluster = m.group(2);
+      }
+      int socketTimeout = parseSocketTimeout(query.replace("?", ""));
+      int retryCount = 0;
+      while (retryCount < MAX_RETRIES) {
+        try {
+          AmsServerInfo serverInfo = findAmsServerInfo(serviceName, zkServerAddress, cluster);
+          String resolvedUrl =
+              String.format(
+                  THRIFT_URL_FORMAT,
+                  serverInfo.getHost(),
+                  serverInfo.getThriftBindPort(),
+                  catalog,
+                  query);
+          return new AmsThriftUrl(
+              THRIFT_SCHEME,
+              serverInfo.getHost(),
+              serverInfo.getThriftBindPort(),
+              catalog,
+              socketTimeout,
+              resolvedUrl);
+        } catch (KeeperException.AuthFailedException authFailedException) {
+          // If kerberos authentication is not enabled on the zk,
+          // an error occurs when the thread carrying kerberos authentication information accesses
+          // the zk.
+          // Therefore, clear the authentication information and try again
+          retryCount++;
+          logger.error(
+              String.format("Caught exception, retrying... (retry count: %s)", retryCount),
+              authFailedException);
+          try {
+            Subject subject = Subject.getSubject(java.security.AccessController.getContext());
+
+            if (subject != null) {
+              LoginContext loginContext = new LoginContext("", subject);
+              loginContext.logout();
+            }
+          } catch (LoginException e) {
+            logger.error("Failed to logout", e);
+          }
+        } catch (Exception e) {
+          retryCount++;
+          logger.error(
+              String.format("Caught exception, retrying... (retry count: %s)", retryCount), e);
+          throw new RuntimeException(
+              String.format("Failed to resolve AMS URL from ZooKeeper URL: %s", url), e);
+        }
+      }
+    } else {
+      throw new IllegalArgumentException(
+          String.format(
+              "Invalid ZooKeeper URL, expected zookeeper://host:port/cluster[/catalog]: %s", url));
+    }
+    return null;
+  }
+
+  private static AmsServerInfo findAmsServerInfo(
+      String serviceName, String zkServerAddress, String cluster) throws Exception {
+    switch (serviceName) {
+      case Constants.THRIFT_TABLE_SERVICE_NAME:
+        return JacksonUtil.parseObject(
+            ZookeeperService.getInstance(zkServerAddress)
+                .getData(AmsHAProperties.getTableServiceMasterPath(cluster)),
+            AmsServerInfo.class);
+      case Constants.THRIFT_OPTIMIZING_SERVICE_NAME:
+        return JacksonUtil.parseObject(
+            ZookeeperService.getInstance(zkServerAddress)
+                .getData(AmsHAProperties.getOptimizingServiceMasterPath(cluster)),
+            AmsServerInfo.class);
+      default:
+        throw new RuntimeException(String.format("invalid service name %s", serviceName));
+    }
+  }
+
+  public static List<AmsServerInfo> parseMasterSlaveAmsNodes(String url) {
+    if (url == null) {
+      throw new IllegalArgumentException("thrift url is null");
+    }
+    return parserZookeeperUrlListForMasterSlaveMode(url);
+  }
+
+  private static List<AmsServerInfo> parserZookeeperUrlListForMasterSlaveMode(String url) {
+    if (!url.regionMatches(true, 0, ZOOKEEPER_SCHEME_PREFIX, 0, ZOOKEEPER_SCHEME_PREFIX.length())) {
+      throw new IllegalArgumentException(
+          "parseMasterSlaveAmsNodes only supports ZooKeeper URL format: zookeeper://host:port/cluster");
+    }
+    String thriftUrl = url;
+    if (url.contains("?")) {
+      thriftUrl = url.substring(0, url.indexOf("?"));
+    }
+    Matcher m = PATTERN.matcher(thriftUrl);
+    if (!m.matches()) {
+      throw new IllegalArgumentException(
+          String.format("Invalid ZooKeeper URL, expected zookeeper://host:port/cluster: %s", url));
+    }
+    String zkServerAddress;
+    String cluster;
+    if (m.group(1).contains("/")) {
+      zkServerAddress = m.group(1).substring(0, m.group(1).indexOf("/"));
+      cluster = m.group(1).substring(m.group(1).indexOf("/") + 1);
+    } else {
+      zkServerAddress = m.group(1);
+      cluster = m.group(2);
+    }
+    List<AmsServerInfo> serverInfoList = new ArrayList<>();
+    int retryCount = 0;
+    while (retryCount < MAX_RETRIES) {
+      try {
+        ZookeeperService zkService = ZookeeperService.getInstance(zkServerAddress);
+        String nodesPath = AmsHAProperties.getNodesPath(cluster);
+        List<String> nodePaths = zkService.getChildren(nodesPath);
+        for (String nodePath : nodePaths) {
+          try {
+            String fullPath = nodesPath + "/" + nodePath;
+            String nodeInfoJson = zkService.getData(fullPath);
+            if (nodeInfoJson != null && !nodeInfoJson.isEmpty()) {
+              AmsServerInfo nodeInfo = JacksonUtil.parseObject(nodeInfoJson, AmsServerInfo.class);
+              serverInfoList.add(nodeInfo);
+            }
+          } catch (Exception e) {
+            logger.warn("Failed to get node info for path: {}", nodePath, e);
+          }
+        }
+        if (!serverInfoList.isEmpty()) {
+          logger.info("Found {} AMS nodes from ZooKeeper", serverInfoList.size());
+          return serverInfoList;
+        } else {
+          logger.warn("No AMS nodes found in ZooKeeper path: {}", nodesPath);
+          return serverInfoList;
+        }
+      } catch (KeeperException.AuthFailedException authFailedException) {
+        // If kerberos authentication is not enabled on the zk,
+        // an error occurs when the thread carrying kerberos authentication information accesses
+        // the zk.
+        // Therefore, clear the authentication information and try again
+        retryCount++;
+        logger.error(
+            String.format("Caught exception, retrying... (retry count: %s)", retryCount),
+            authFailedException);
+        try {
+          Subject subject = Subject.getSubject(java.security.AccessController.getContext());
+          if (subject != null) {
+            LoginContext loginContext = new LoginContext("", subject);
+            loginContext.logout();
+          }
+        } catch (LoginException e) {
+          logger.error("Failed to logout", e);
+        }
+      } catch (KeeperException.NoNodeException e) {
+        logger.debug("Nodes path does not exist: {}", AmsHAProperties.getNodesPath(cluster));
+        return serverInfoList;
+      } catch (Exception e) {
+        retryCount++;
+        logger.error(
+            String.format("Caught exception, retrying... (retry count: %s)", retryCount), e);
+        if (retryCount >= MAX_RETRIES) {
+          throw new RuntimeException(
+              String.format("Failed to get AMS nodes from ZooKeeper for url %s", url), e);
+        }
+      }
+    }
+    return serverInfoList;
+  }
+
+  public String schema() {
+    return schema;
+  }
+
+  public String host() {
+    return host;
+  }
+
+  public int port() {
+    return port;
+  }
+
+  public String catalogName() {
+    return catalogName;
+  }
+
+  public int socketTimeout() {
+    return socketTimeout;
+  }
+
+  public String url() {
+    return url;
+  }
+
+  public String serverUrl() {
+    return String.format(THRIFT_URL_FORMAT, host, port, "", "");
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("schema", schema)
+        .add("host", host)
+        .add("port", port)
+        .add("catalogName", catalogName)
+        .add("socketTimeout", socketTimeout)
+        .add("url", url)
+        .toString();
+  }
+}

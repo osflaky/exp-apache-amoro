@@ -1,0 +1,750 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.amoro.server.process;
+
+import org.apache.amoro.Action;
+import org.apache.amoro.AmoroTable;
+import org.apache.amoro.ServerTableIdentifier;
+import org.apache.amoro.TableFormat;
+import org.apache.amoro.TableRuntime;
+import org.apache.amoro.config.TableConfiguration;
+import org.apache.amoro.process.ActionCoordinator;
+import org.apache.amoro.process.ExecuteEngine;
+import org.apache.amoro.process.ProcessEvent;
+import org.apache.amoro.process.ProcessStatus;
+import org.apache.amoro.process.TableProcess;
+import org.apache.amoro.process.TableProcessStore;
+import org.apache.amoro.server.manager.AbstractPluginManager;
+import org.apache.amoro.server.optimizing.OptimizingStatus;
+import org.apache.amoro.server.persistence.PersistentBase;
+import org.apache.amoro.server.persistence.mapper.TableProcessMapper;
+import org.apache.amoro.server.process.executor.TableProcessExecutor;
+import org.apache.amoro.server.table.RuntimeHandlerChain;
+import org.apache.amoro.server.table.TableService;
+import org.apache.amoro.shade.guava32.com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+/**
+ * Service to coordinate table processes: registering, recovering, retrying and canceling. It
+ * manages installed {@link ActionCoordinator}s and {@link ExecuteEngine}s and tracks active
+ * processes.
+ */
+public class ProcessService extends PersistentBase {
+  private static final Logger LOG = LoggerFactory.getLogger(ProcessService.class);
+  private final TableService tableService;
+
+  private final Map<String, List<ActionCoordinatorScheduler>> actionCoordinators =
+      new ConcurrentHashMap<>();
+  private final Map<String, ExecuteEngine> executeEngines = new ConcurrentHashMap<>();
+
+  private final ExecuteEngineManager executeEngineManager;
+  private final List<ActionCoordinator> actionCoordinatorList;
+  private final ProcessRuntimeHandler tableRuntimeHandler = new ProcessRuntimeHandler();
+  private final ThreadPoolExecutor processExecutionPool =
+      new ThreadPoolExecutor(10, 100, 60, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+
+  private final Map<ServerTableIdentifier, Map<Long, TableProcessHolder>> activeTableProcess =
+      new ConcurrentHashMap<>();
+  // Guards against concurrent recovery of the same processId (e.g. startup recovery racing with
+  // handleTableAdded).
+  private final Set<Long> recoveringProcessIds = ConcurrentHashMap.newKeySet();
+
+  public ProcessService(TableService tableService) {
+    this(tableService, Collections.emptyList(), new ExecuteEngineManager());
+  }
+
+  public ProcessService(
+      TableService tableService,
+      List<ActionCoordinator> actionCoordinators,
+      ExecuteEngineManager executeEngineManager) {
+    this.tableService = tableService;
+    this.actionCoordinatorList = actionCoordinators;
+    this.executeEngineManager = executeEngineManager;
+  }
+
+  /**
+   * Get the runtime handler chain for process-related table events.
+   *
+   * @return handler chain
+   */
+  public RuntimeHandlerChain getTableHandlerChain() {
+    return tableRuntimeHandler;
+  }
+
+  /**
+   * Register and submit a table process for a given table runtime.
+   *
+   * @param tableRuntime table runtime
+   * @param process table process
+   */
+  public void register(TableRuntime tableRuntime, TableProcess process) {
+    if (hasAliveTableProcess(tableRuntime, process.getAction())) {
+      LOG.warn(
+          "Detect alive table process exists for table runtime: {}, skip schedule {} action this time.",
+          tableRuntime.getTableIdentifier(),
+          process.getAction());
+      return;
+    }
+    TableProcessStore store = persistTableProcess(process);
+    trackTableProcess(tableRuntime.getTableIdentifier(), store, process);
+    executeOrTraceProcess(store, process);
+  }
+
+  /** Dispose the service, shutdown engines and clear active processes. */
+  public void dispose() {
+    executeEngineManager.close();
+    processExecutionPool.shutdown();
+    activeTableProcess.clear();
+  }
+
+  /**
+   * Find the scheduler that supports the given table format for the specified action.
+   *
+   * @param actionName action name
+   * @param format table format
+   * @return matching scheduler, or null if not found
+   */
+  private ActionCoordinatorScheduler findScheduler(String actionName, TableFormat format) {
+    List<ActionCoordinatorScheduler> schedulers = actionCoordinators.get(actionName);
+    if (schedulers == null) {
+      return null;
+    }
+    for (ActionCoordinatorScheduler scheduler : schedulers) {
+      if (scheduler.formatSupported(format)) {
+        return scheduler;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find all schedulers that support the given table format across all actions.
+   *
+   * @param format table format
+   * @return list of matching schedulers
+   */
+  private List<ActionCoordinatorScheduler> findSchedulersByFormat(TableFormat format) {
+    List<ActionCoordinatorScheduler> result = new ArrayList<>();
+    for (List<ActionCoordinatorScheduler> schedulers : actionCoordinators.values()) {
+      for (ActionCoordinatorScheduler scheduler : schedulers) {
+        if (scheduler.formatSupported(format)) {
+          result.add(scheduler);
+        }
+      }
+    }
+    return result;
+  }
+
+  private void initialize(List<TableRuntime> tableRuntimes) {
+    LOG.info("Initializing process service");
+    // Pre-configured coordinators built from TableRuntimeFactory / ProcessFactory
+    for (ActionCoordinator actionCoordinator : actionCoordinatorList) {
+      ActionCoordinatorScheduler scheduler =
+          new ActionCoordinatorScheduler(actionCoordinator, tableService, ProcessService.this);
+      List<ActionCoordinatorScheduler> schedulers =
+          actionCoordinators.computeIfAbsent(
+              actionCoordinator.action().getName(), k -> new CopyOnWriteArrayList<>());
+      // Validate (action, format) uniqueness: warn if a scheduler with overlapping format support
+      // already exists for the same action
+      for (ActionCoordinatorScheduler existing : schedulers) {
+        for (TableFormat format : TableFormat.values()) {
+          if (existing.getCoordinator().formatSupported(format)
+              && actionCoordinator.formatSupported(format)) {
+            LOG.warn(
+                "Duplicate ActionCoordinator for action {} and format {}: existing={}, new={}. "
+                    + "The later one will shadow the former in findScheduler.",
+                actionCoordinator.action().getName(),
+                format,
+                existing.getCoordinator().name(),
+                actionCoordinator.name());
+          }
+        }
+      }
+      schedulers.add(scheduler);
+    }
+    executeEngineManager
+        .installedPlugins()
+        .forEach(
+            executeEngine -> {
+              executeEngines.put(executeEngine.name(), executeEngine);
+            });
+    recoverProcesses(tableRuntimes);
+    actionCoordinators.values().forEach(list -> list.forEach(s -> s.initialize(tableRuntimes)));
+  }
+
+  /**
+   * Recover active processes from persistence for given table runtimes.
+   *
+   * @param tableRuntimes runtimes to recover
+   */
+  @VisibleForTesting
+  public void recoverProcesses(List<TableRuntime> tableRuntimes) {
+    Map<Long, TableRuntime> tableIdToRuntimes =
+        tableRuntimes.stream()
+            .collect(Collectors.toMap(t -> t.getTableIdentifier().getId(), t -> t));
+    // InListExtendedLanguageDriver requires at least one value to produce a valid IN clause.
+    if (tableIdToRuntimes.isEmpty()) {
+      return;
+    }
+    List<TableProcessMeta> activeProcesses =
+        getAs(
+            TableProcessMapper.class,
+            mapper -> mapper.selectActiveProcesses(tableIdToRuntimes.keySet()));
+    activeProcesses.forEach(
+        processMeta -> {
+          TableRuntime tableRuntime = tableIdToRuntimes.get(processMeta.getTableId());
+          if (tableRuntime != null) {
+            ActionCoordinatorScheduler scheduler =
+                findScheduler(processMeta.getProcessType(), tableRuntime.getFormat());
+            if (scheduler != null) {
+              recoverProcess(tableRuntime, scheduler, processMeta);
+            } else {
+              LOG.warn(
+                  "No ActionCoordinatorScheduler found for process {} (type={}, format={}), "
+                      + "skipping recovery. The process record will remain in its current state.",
+                  processMeta.getProcessId(),
+                  processMeta.getProcessType(),
+                  tableRuntime.getFormat());
+            }
+          } else {
+            LOG.warn(
+                "Table runtime not found for process {} (tableId={}), skipping recovery.",
+                processMeta.getProcessId(),
+                processMeta.getTableId());
+          }
+        });
+  }
+
+  /**
+   * Recover a single persisted process record. Any failure is contained here: the offending record
+   * is marked {@link ProcessStatus#FAILED} and skipped, so that one un-recoverable process record
+   * cannot abort process recovery (see AMORO-4223). The affected maintenance action will be
+   * re-scheduled by its periodic scheduler.
+   *
+   * @param tableRuntime table runtime
+   * @param scheduler coordinator scheduler for the process type
+   * @param processMeta persisted process metadata
+   */
+  private void recoverProcess(
+      TableRuntime tableRuntime,
+      ActionCoordinatorScheduler scheduler,
+      TableProcessMeta processMeta) {
+    long processId = processMeta.getProcessId();
+    if (!recoveringProcessIds.add(processId)) {
+      LOG.debug(
+          "Table process {} for table {} is already being recovered, skipping duplicate recovery.",
+          processId,
+          tableRuntime.getTableIdentifier());
+      return;
+    }
+    try {
+      if (getTableProcessInstances(tableRuntime.getTableIdentifier()).containsKey(processId)) {
+        LOG.debug(
+            "Table process {} for table {} is already tracked, skipping duplicate recovery.",
+            processId,
+            tableRuntime.getTableIdentifier());
+        return;
+      }
+      DefaultTableProcessStore store =
+          new DefaultTableProcessStore(
+              processId,
+              tableRuntime,
+              processMeta,
+              scheduler.getAction(),
+              ActionCoordinatorScheduler.PROCESS_MAX_RETRY_NUMBER);
+      try {
+        TableProcess process = scheduler.recover(tableRuntime, store);
+        trackTableProcess(tableRuntime.getTableIdentifier(), store, process);
+        executeOrTraceProcess(store, process);
+      } catch (Throwable t) {
+        LOG.error(
+            "Failed to recover table process {} (action {}) for table {}, marking it FAILED "
+                + "and continuing recovery.",
+            processId,
+            scheduler.getAction(),
+            tableRuntime.getTableIdentifier(),
+            t);
+        markRecoverFailed(store, t);
+      }
+    } finally {
+      recoveringProcessIds.remove(processId);
+    }
+  }
+
+  /**
+   * Best-effort mark an un-recoverable process as {@link ProcessStatus#FAILED} so it is not picked
+   * up again by a later recovery attempt. Never throws.
+   *
+   * @param store process store
+   * @param cause the recovery failure
+   */
+  private void markRecoverFailed(DefaultTableProcessStore store, Throwable cause) {
+    try {
+      String failMessage =
+          String.format(
+              "Failed to recover process: %s (processId=%s, tableId=%s, action=%s, engine=%s, "
+                  + "externalIdentifier=%s)",
+              cause.getMessage(),
+              store.getProcessId(),
+              store.getTableId(),
+              store.getAction(),
+              store.getExecutionEngine(),
+              store.getExternalProcessIdentifier());
+      store.tryTransitState(
+          ProcessStatus.FAILED,
+          ProcessEvent.COMPLETE_FAILED,
+          store.getExternalProcessIdentifier(),
+          failMessage,
+          store.getProcessParameters(),
+          store.getSummary());
+    } catch (Throwable t) {
+      LOG.error(
+          "Failed to mark un-recoverable table process {} as FAILED; a later recovery attempt "
+              + "may retry it.",
+          store.getProcessId(),
+          t);
+    }
+  }
+
+  /**
+   * Execute the process or trace it if not executable.
+   *
+   * @param process table process
+   */
+  private void executeOrTraceProcess(TableProcessStore store, TableProcess process) {
+    if (!isExecutable(store)) {
+      LOG.info(
+          "Table process {} with identifier {} may have been in canceling or canceled, cancel execute process.",
+          store.getProcessId(),
+          store.getExternalProcessIdentifier());
+      return;
+    }
+
+    ExecuteEngine executeEngine = executeEngines.get(store.getExecutionEngine());
+    if (executeEngine == null) {
+      LOG.error(
+          "Can't found execution engine:{} for process:{}, table:{}",
+          store.getExecutionEngine(),
+          store.getAction(),
+          process.getTableIdentifier());
+      return;
+    }
+
+    TableProcessExecutor executor = new TableProcessExecutor(process, store, executeEngine);
+    executor.onProcessFinished(
+        () -> {
+          ActionCoordinatorScheduler scheduler = null;
+          if (process.getTableRuntime() != null) {
+            scheduler =
+                findScheduler(store.getAction().getName(), process.getTableRuntime().getFormat());
+          }
+          boolean retryScheduled = false;
+          if (scheduler != null
+              && store.getStatus() == ProcessStatus.FAILED
+              && store.getRetryNumber() < ActionCoordinatorScheduler.PROCESS_MAX_RETRY_NUMBER
+              && process.getTableRuntime() != null) {
+            // Only resubmit when the retry transition is accepted; resubmitting a process whose
+            // transition was rejected (e.g. already terminal) would loop forever without ever
+            // increasing the retry number.
+            retryScheduled =
+                store.tryTransitState(
+                    ProcessStatus.PENDING,
+                    ProcessEvent.RETRY_REQUESTED,
+                    store.getExternalProcessIdentifier(),
+                    "Regular Retry.",
+                    process.getProcessParameters(),
+                    process.getSummary());
+          }
+          if (retryScheduled) {
+            executeOrTraceProcess(store, process);
+          } else {
+            if (store.getStatus() == ProcessStatus.FAILED && process.getTableRuntime() != null) {
+              LOG.info(
+                  "FAILED process {} will not be retried: scheduler={}, retryNumber={}, maxRetry={}",
+                  store.getProcessId(),
+                  scheduler != null ? "found" : "not found",
+                  store.getRetryNumber(),
+                  ActionCoordinatorScheduler.PROCESS_MAX_RETRY_NUMBER);
+            }
+            untrackTableProcessInstance(
+                process.getTableRuntime().getTableIdentifier(), store.getProcessId());
+          }
+        });
+
+    processExecutionPool.submit(executor);
+
+    LOG.info(
+        "Submit table process {} to engine {}, process id:{}",
+        process,
+        executeEngine.engineType(),
+        store.getProcessId());
+  }
+
+  /**
+   * Cancel the given process and untrack it.
+   *
+   * @param process table process
+   */
+  private void cancelProcess(TableProcessStore store, TableProcess process) {
+
+    store.tryTransitState(
+        ProcessStatus.CANCELED,
+        ProcessEvent.CANCEL_REQUESTED,
+        store.getExternalProcessIdentifier(),
+        "Gracefully Canceled.",
+        process.getProcessParameters(),
+        process.getSummary());
+    untrackTableProcessInstance(
+        process.getTableRuntime().getTableIdentifier(), store.getProcessId());
+
+    ExecuteEngine executeEngine = executeEngines.get(store.getExecutionEngine());
+
+    if (executeEngine != null) {
+      executeEngine.tryCancelTableProcess(process, store.getExternalProcessIdentifier());
+      LOG.info(
+          "Cancel table process {} in engine {}, process id:{}",
+          process,
+          executeEngine.name(),
+          store.getProcessId());
+    }
+  }
+
+  /**
+   * Whether the process can be executed.
+   *
+   * @param process table process
+   * @return true if executable
+   */
+  private boolean isExecutable(TableProcessStore process) {
+    if (process.getStatus() == ProcessStatus.CANCELING
+        || process.getStatus() == ProcessStatus.CANCELED) {
+      return false;
+    } else {
+      return true;
+    }
+  }
+
+  /**
+   * Check whether there is any alive process for the table runtime and action.
+   *
+   * @param tableRuntime table runtime
+   * @param action action type
+   * @return true if exists
+   */
+  private boolean hasAliveTableProcess(TableRuntime tableRuntime, Action action) {
+    List<TableProcessHolder> processes =
+        getTableProcessInstances(tableRuntime.getTableIdentifier()).values().stream()
+            .filter(
+                tableProcess ->
+                    tableProcess
+                        .getStore()
+                        .getAction()
+                        .getName()
+                        .equalsIgnoreCase(action.getName()))
+            .collect(Collectors.toList());
+
+    return processes.stream()
+        .anyMatch(
+            process -> {
+              return (process != null
+                  && (process.getStore().getStatus() == ProcessStatus.RUNNING
+                      || process.getStore().getStatus() == ProcessStatus.SUBMITTED
+                      || process.getStore().getStatus() == ProcessStatus.PENDING));
+            });
+  }
+
+  /**
+   * Persist a process to storage and return its metadata snapshot.
+   *
+   * @param process table process
+   * @return metadata snapshot
+   */
+  protected DefaultTableProcessStore persistTableProcess(TableProcess process) {
+    TableProcessMeta processMeta = TableProcessMeta.createProcessMeta(process);
+    doAs(
+        TableProcessMapper.class,
+        mapper ->
+            mapper.insertProcess(
+                processMeta.getTableId(),
+                processMeta.getProcessId(),
+                processMeta.getExternalProcessIdentifier(),
+                processMeta.getStatus(),
+                processMeta.getProcessType(),
+                processMeta.getProcessStage(),
+                processMeta.getExecutionEngine(),
+                processMeta.getRetryNumber(),
+                processMeta.getCreateTime(),
+                processMeta.getProcessParameters(),
+                processMeta.getSummary()));
+    return new DefaultTableProcessStore(
+        processMeta.getProcessId(),
+        process.getTableRuntime(),
+        processMeta,
+        process.getAction(),
+        ActionCoordinatorScheduler.PROCESS_MAX_RETRY_NUMBER);
+  }
+
+  /**
+   * Get installed action coordinators.
+   *
+   * @return coordinators map
+   */
+  @VisibleForTesting
+  public Map<String, List<ActionCoordinatorScheduler>> getActionCoordinators() {
+    return actionCoordinators;
+  }
+
+  /**
+   * Get installed execute engines.
+   *
+   * @return engines map
+   */
+  @VisibleForTesting
+  public Map<String, ExecuteEngine> getExecuteEngines() {
+    return executeEngines;
+  }
+
+  /**
+   * Get all active table processes tracked by service.
+   *
+   * @return active process map
+   */
+  @VisibleForTesting
+  public Map<ServerTableIdentifier, Map<Long, TableProcessHolder>> getActiveTableProcess() {
+    return activeTableProcess;
+  }
+
+  /**
+   * Get all table process instances for the given table identifier.
+   *
+   * @param serverTableIdentifier table identifier
+   * @return unmodifiable map of processes
+   */
+  @VisibleForTesting
+  public Map<Long, TableProcessHolder> getTableProcessInstances(
+      ServerTableIdentifier serverTableIdentifier) {
+    Map<Long, TableProcessHolder> inner = activeTableProcess.get(serverTableIdentifier);
+    if (inner == null || inner.isEmpty()) {
+      return Collections.emptyMap();
+    }
+    return Collections.unmodifiableMap(inner);
+  }
+
+  /**
+   * Track a table process in active map.
+   *
+   * @param serverTableIdentifier table identifier
+   * @param tableProcess process instance
+   */
+  private void trackTableProcess(
+      ServerTableIdentifier serverTableIdentifier,
+      TableProcessStore store,
+      TableProcess tableProcess) {
+    activeTableProcess
+        .computeIfAbsent(serverTableIdentifier, key -> new ConcurrentHashMap<>())
+        .put(store.getProcessId(), new TableProcessHolder(tableProcess, store));
+  }
+
+  /**
+   * Untrack a process instance and return the removed entry.
+   *
+   * @param serverTableIdentifier table identifier
+   * @param processId process id
+   * @return removed process or null
+   */
+  @VisibleForTesting
+  public TableProcess untrackTableProcessInstance(
+      ServerTableIdentifier serverTableIdentifier, long processId) {
+    Map<Long, TableProcessHolder> inner = activeTableProcess.get(serverTableIdentifier);
+    if (inner == null) {
+      return null;
+    }
+    TableProcessHolder removed = inner.remove(processId);
+    if (inner.isEmpty()) {
+      activeTableProcess.remove(serverTableIdentifier, inner);
+    }
+    return removed != null ? removed.getProcess() : null;
+  }
+
+  @VisibleForTesting
+  public void installActionCoordinator(ActionCoordinator actionCoordinator) {
+    ActionCoordinatorScheduler scheduler =
+        new ActionCoordinatorScheduler(actionCoordinator, tableService, ProcessService.this);
+    List<ActionCoordinatorScheduler> schedulers =
+        this.actionCoordinators.computeIfAbsent(
+            actionCoordinator.action().getName(), k -> new CopyOnWriteArrayList<>());
+    // Validate (action, format) uniqueness
+    for (ActionCoordinatorScheduler existing : schedulers) {
+      for (TableFormat format : TableFormat.values()) {
+        if (existing.getCoordinator().formatSupported(format)
+            && actionCoordinator.formatSupported(format)) {
+          LOG.warn(
+              "Duplicate ActionCoordinator for action {} and format {}: existing={}, new={}.",
+              actionCoordinator.action().getName(),
+              format,
+              existing.getCoordinator().name(),
+              actionCoordinator.name());
+        }
+      }
+    }
+    schedulers.add(scheduler);
+  }
+
+  @VisibleForTesting
+  public void unInstallAllActionCoordinators() {
+    this.actionCoordinators.clear();
+  }
+
+  @VisibleForTesting
+  public void installExecuteEngine(ExecuteEngine executeEngine) {
+    this.executeEngines.put(executeEngine.name(), executeEngine);
+  }
+
+  @VisibleForTesting
+  public void unInstallAllExecuteEngines() {
+    this.executeEngines.clear();
+  }
+
+  /** Runtime handler that forwards table events to all installed action coordinators. */
+  private class ProcessRuntimeHandler extends RuntimeHandlerChain {
+
+    /**
+     * Accept all formats for process handler.
+     *
+     * @param format table format
+     * @return always true
+     */
+    @Override
+    protected boolean formatSupported(TableFormat format) {
+      return true;
+    }
+
+    /**
+     * Handle table status changed.
+     *
+     * @param tableRuntime table runtime
+     * @param originalStatus original optimizing status
+     */
+    @Override
+    protected void handleStatusChanged(TableRuntime tableRuntime, OptimizingStatus originalStatus) {
+      findSchedulersByFormat(tableRuntime.getFormat())
+          .forEach(s -> s.handleStatusChanged(tableRuntime, originalStatus));
+    }
+
+    /**
+     * Handle table configuration changed.
+     *
+     * @param tableRuntime table runtime
+     * @param originalConfig original configuration
+     */
+    @Override
+    protected void handleConfigChanged(
+        TableRuntime tableRuntime, TableConfiguration originalConfig) {
+      findSchedulersByFormat(tableRuntime.getFormat())
+          .forEach(s -> s.handleConfigChanged(tableRuntime, originalConfig));
+    }
+
+    /**
+     * Handle table added event.
+     *
+     * @param table table
+     * @param tableRuntime table runtime
+     */
+    @Override
+    protected void handleTableAdded(AmoroTable<?> table, TableRuntime tableRuntime) {
+      recoverProcesses(Collections.singletonList(tableRuntime));
+      findSchedulersByFormat(tableRuntime.getFormat())
+          .forEach(s -> s.handleTableAdded(table, tableRuntime));
+    }
+
+    /**
+     * Handle table removed event: cancel all related processes.
+     *
+     * @param tableRuntime table runtime
+     */
+    @Override
+    protected void handleTableRemoved(TableRuntime tableRuntime) {
+      findSchedulersByFormat(tableRuntime.getFormat())
+          .forEach(s -> s.handleTableRemoved(tableRuntime));
+      List<TableProcessHolder> processes =
+          getTableProcessInstances(tableRuntime.getTableIdentifier()).values().stream()
+              .collect(Collectors.toList());
+      for (TableProcessHolder holder : processes) {
+        if (holder != null) {
+          cancelProcess(holder.getStore(), holder.getProcess());
+        }
+      }
+    }
+
+    /**
+     * Initialize handler with all table runtimes.
+     *
+     * @param tableRuntimeList runtime list
+     */
+    @Override
+    protected void initHandler(List<TableRuntime> tableRuntimeList) {
+      ProcessService.this.initialize(tableRuntimeList);
+    }
+
+    /** Dispose handler. */
+    @Override
+    protected void doDispose() {
+      // TODO: dispose
+    }
+  }
+
+  @VisibleForTesting
+  public static class TableProcessHolder {
+    private final TableProcess process;
+    private final TableProcessStore store;
+
+    public TableProcessHolder(TableProcess process, TableProcessStore store) {
+      this.process = process;
+      this.store = store;
+    }
+
+    public TableProcess getProcess() {
+      return process;
+    }
+
+    public TableProcessStore getStore() {
+      return store;
+    }
+  }
+
+  /** Manager for {@link ExecuteEngine} plugins. */
+  public static class ExecuteEngineManager extends AbstractPluginManager<ExecuteEngine> {
+    public ExecuteEngineManager() {
+      super("execute-engines");
+    }
+  }
+}
